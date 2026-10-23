@@ -1,0 +1,175 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+    }
+
+    stages {
+        stage('Validate Project') {
+            steps {
+                sh '''
+                    set -eu
+                    test -f Dockerfile
+                    test -f nginx.conf
+                    test -f deployment-proxy/nginx.conf
+                    test -d build
+                    docker --version
+                    docker compose version
+                    echo "Project validation successful"
+                '''
+            }
+        }
+
+        stage('Build and Push Image') {
+            when {
+                anyOf {
+                    branch 'dev'
+                    branch 'master'
+                }
+            }
+
+            steps {
+                script {
+                    def imageRepo = env.BRANCH_NAME == 'dev'
+                        ? 'farhadbaig/dev'
+                        : 'farhadbaig/prod'
+
+                    def imageTag = sh(
+                        script: 'git rev-parse --short=7 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.BUILD_IMAGE = "${imageRepo}:${imageTag}"
+
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: 'dockerhub-creds',
+                            usernameVariable: 'DOCKERHUB_USER',
+                            passwordVariable: 'DOCKERHUB_TOKEN'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+                            trap 'docker logout >/dev/null 2>&1 || true' EXIT
+
+                            printf '%s' "$DOCKERHUB_TOKEN" |
+                                docker login \
+                                    --username "$DOCKERHUB_USER" \
+                                    --password-stdin
+
+                            docker build --tag "$BUILD_IMAGE" .
+                            docker push "$BUILD_IMAGE"
+
+                            echo "Published $BUILD_IMAGE"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy and Validate Candidate') {
+            when {
+                branch 'dev'
+            }
+
+            steps {
+                sh '''
+                    set -eu
+
+                    IMAGE="$BUILD_IMAGE"
+                    PROXY_BACKUP="/tmp/proxy-backup-${BUILD_NUMBER}.conf"
+                    PROXY_NEW="/tmp/proxy-new-${BUILD_NUMBER}.conf"
+
+                    echo "Checking deployment prerequisites"
+
+                    docker inspect jenkins-proxy >/dev/null
+                    docker inspect candidate-web >/dev/null
+
+                    docker exec jenkins-proxy \
+                        cat /etc/nginx/nginx.conf > "$PROXY_BACKUP"
+
+                    BACKUP_IMAGE=$(docker inspect \
+                        --format='{{.Config.Image}}' candidate-web)
+
+                    echo "Previous candidate image: $BACKUP_IMAGE"
+                    echo "New candidate image: $IMAGE"
+
+                    rollback_candidate() {
+                        docker rm -f candidate-web >/dev/null 2>&1 || true
+
+                        if [ -n "$BACKUP_IMAGE" ]; then
+                            docker run -d \
+                                --name candidate-web \
+                                --restart unless-stopped \
+                                -p 8082:80 \
+                                "$BACKUP_IMAGE"
+                        fi
+                    }
+
+                    rollback_proxy() {
+                        docker cp "$PROXY_BACKUP" \
+                            jenkins-proxy:/etc/nginx/nginx.conf
+                        docker exec jenkins-proxy nginx -t
+                        docker exec jenkins-proxy nginx -s reload
+                    }
+
+                    docker rm -f candidate-web
+
+                    docker run -d \
+                        --name candidate-web \
+                        --restart unless-stopped \
+                        -p 8082:80 \
+                        "$IMAGE"
+
+                    if ! curl --fail --silent --show-error \
+                        --retry 10 --retry-delay 2 --retry-connrefused \
+                        http://127.0.0.1:8082/health; then
+
+                        echo "Candidate health check failed; restoring previous candidate"
+                        rollback_candidate
+                        exit 1
+                    fi
+
+                    echo "Candidate health check passed"
+
+                    sed \
+                        's/server host.docker.internal:[0-9][0-9]*/server host.docker.internal:8082/' \
+                        deployment-proxy/nginx.conf > "$PROXY_NEW"
+
+                    docker cp "$PROXY_NEW" \
+                        jenkins-proxy:/etc/nginx/nginx.conf
+
+                    if ! docker exec jenkins-proxy nginx -t; then
+                        echo "Proxy configuration invalid; restoring previous configuration"
+                        rollback_proxy
+                        rollback_candidate
+                        exit 1
+                    fi
+
+                    if ! docker exec jenkins-proxy nginx -s reload; then
+                        echo "Proxy reload failed; restoring previous configuration"
+                        rollback_proxy
+                        rollback_candidate
+                        exit 1
+                    fi
+
+                    if ! curl --fail --silent --show-error \
+                        --retry 5 --retry-delay 2 \
+                        http://127.0.0.1:8084/health; then
+
+                        echo "Proxy validation failed; rolling back"
+                        rollback_proxy
+                        rollback_candidate
+                        exit 1
+                    fi
+
+                    echo
+                    echo "Candidate deployment and proxy validation successful"
+                    docker ps --filter name=candidate-web \
+                        --filter name=jenkins-proxy
+                '''
+            }
+        }
+    }
+}
