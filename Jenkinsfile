@@ -60,6 +60,47 @@ pipeline {
                             echo "Published ${imageRepo}:${imageTag}"
                         """
                     }
+
+                    if (env.BRANCH_NAME == 'master') {
+                        sh """
+                            set -eu
+
+                            IMAGE='${imageRepo}:${imageTag}'
+                            BACKUP_IMAGE=\$(docker inspect --format='{{.Config.Image}}' prod-web)
+
+                            echo "Deploying \$IMAGE"
+                            echo "Previous image: \$BACKUP_IMAGE"
+
+                            docker rm -f prod-web
+
+                            docker run -d \
+                                --name prod-web \
+                                --restart unless-stopped \
+                                -p 8081:80 \
+                                "\$IMAGE"
+
+                            if ! curl --fail --silent --show-error \
+                                --retry 10 --retry-delay 2 --retry-connrefused \
+                                http://127.0.0.1:8081/health; then
+
+                                echo "Health check failed. Rolling back."
+
+                                docker rm -f prod-web || true
+
+                                docker run -d \
+                                    --name prod-web \
+                                    --restart unless-stopped \
+                                    -p 8081:80 \
+                                    "\$BACKUP_IMAGE"
+
+                                exit 1
+                            fi
+
+                            echo
+                            echo "Production deployment successful"
+                            docker ps --filter name=prod-web
+                        """
+                    }
                 }
             }
         }
