@@ -1,0 +1,9 @@
+services:
+  web:
+    image: react-app:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:80"
+    restart: unless-stopped
